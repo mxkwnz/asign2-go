@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"errors"
+	"log"
 	"order-service/internal/domain"
 	"order-service/internal/ports"
 	"order-service/internal/repository"
@@ -32,16 +33,20 @@ func (uc *OrderUseCase) CreateOrder(ctx context.Context, o domain.Order) (domain
 
 	o.Status = "Pending"
 	if err := uc.repo.Create(ctx, o); err != nil {
+		log.Printf("Failed to create order: %v", err)
 		return domain.Order{}, err
 	}
 
+	log.Printf("Calling payment for order %s amount %d", o.ID, o.Amount)
 	status, err := uc.payment.Pay(ctx, o.ID, o.Amount)
 	if err != nil {
+		log.Printf("Payment failed with error: %v", err)
 		uc.repo.UpdateStatus(ctx, o.ID, "Failed")
 		o.Status = "Failed"
 		return o, err
 	}
 
+	log.Printf("Payment status: %s", status)
 	if status == "Authorized" {
 		uc.repo.UpdateStatus(ctx, o.ID, "Paid")
 		o.Status = "Paid"

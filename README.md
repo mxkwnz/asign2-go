@@ -1,211 +1,291 @@
-# Clean Architecture Microservices (Order & Payment)
+# Assignment 2 - gRPC Migration & Contract-First Development (Order & Payment)
 
-## 1. Architecture Decisions
-
-This system is designed using **Clean Architecture** combined with **Microservices principles**.
-
-### Why Clean Architecture?
-
-Clean Architecture was chosen to:
-
-* Separate business logic from infrastructure
-* Improve maintainability and testability
-* Allow independent evolution of components
-
-Each service is structured into layers:
-
-* **Domain** – core entities (Order, Payment)
-* **Use Case** – business rules and workflows
-* **Repository** – database access
-* **Transport** – HTTP handlers
-* **Main** – dependency injection
-
-Dependency rule:
-
-* Outer layers depend on inner layers
-* Domain layer has no external dependencies
+**Course:** Advanced Programming 2  
+**Student:** Muhammedali  
+**GitHub:** mxkwnz  
+**Deadline:** 12.04.2026
 
 ---
 
-### Why Microservices?
+## Repository Links
 
-The system is split into two independent services:
-
-* Order Service
-* Payment Service
-
-This allows:
-
-* Independent deployment
-* Loose coupling
-* Clear responsibility separation
-* Scalability
+| Repository | URL |
+|---|---|
+| Proto Files (Repo A) | https://github.com/mxkwnz/ap2-protos |
+| Generated Code (Repo B) | https://github.com/mxkwnz/ap2-generated |
+| Main Project | https://github.com/mxkwnz/Microservices-GO |
 
 ---
 
-### Why REST Communication?
-
-REST was chosen because:
-
-* Simple to implement
-* Easy to debug (Postman)
-* Suitable for synchronous workflows
-
----
-
-### Why Database per Service?
-
-Each service has its own database:
-
-* Prevents tight coupling
-* Ensures data ownership
-* Allows independent scaling
-
----
-
-## 2. Bounded Contexts
-
-The system is divided into two **bounded contexts**:
-
-### Order Context
-
-Responsible for:
-
-* Creating orders
-* Managing order lifecycle
-* Handling cancellation
-* Communicating with Payment Service
-
-Order states:
-
-* Pending
-* Paid
-* Failed
-* Cancelled
-
----
-
-### Payment Context
-
-Responsible for:
-
-* Processing payments
-* Validating payment limits
-* Generating transaction IDs
-* Storing payment results
-
-Payment states:
-
-* Authorized
-* Declined
-
----
-
-### Context Separation
-
-* Order Service does NOT access Payment database
-* Payment Service does NOT access Order database
-* Communication only via HTTP
-
-This ensures:
-
-* Clear boundaries
-* No shared models
-* Proper microservice design
-
----
-
-## 3. Failure Handling
-
-The system is designed to handle failures gracefully.
-
-### Scenario: Payment Service Unavailable
-
-When Order Service calls Payment Service:
-
-* A **timeout of 2 seconds** is applied
-* If Payment Service does not respond:
-
-    * Request is cancelled
-    * Order is marked as **Failed**
-    * HTTP **503 Service Unavailable** is returned
-
----
-
-### Why this approach?
-
-* Prevents system hanging
-* Ensures fast failure detection
-* Maintains system responsiveness
-
----
-
-### Design Decision
-
-Order is marked as **Failed** instead of staying Pending because:
-
-* It avoids uncertainty
-* Makes system state explicit
-* Simplifies client-side handling
-
----
-
-## 4. Idempotency
-
-To prevent duplicate orders:
-
-* The system uses `Idempotency-Key` header
-* Requests with the same key return the same result
-* Ensures safe retries in distributed systems
-
----
-
-## 5. Architecture Diagram
+## Architecture Overview
 
 ```
-Client
-   ↓ HTTP
-Order Service (Port 8080)
-   - Domain (Order)
-   - Use Case (Business Logic)
-   - Repository (order_db)
-   ↓ HTTP (REST)
-Payment Service (Port 8081)
-   - Domain (Payment)
-   - Use Case (Payment Logic)
-   - Repository (payment_db)
-   ↓
-PostgreSQL Databases
-   - order_db
-   - payment_db
+┌─────────────────────────────────────────────────────────────┐
+│                        CLIENT                               │
+│                    (HTTP / Postman)                         │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ REST (JSON)
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│              ORDER SERVICE (port 8080)                      │
+│                                                             │
+│  REST Handler (Gin) → Use Case → Repository → order_db     │
+│                                                             │
+│  gRPC Server: SubscribeToOrderUpdates (stream) :9090        │
+│  gRPC Client: calls Payment Service :9091                   │
+└──────────────┬──────────────────────────┬───────────────────┘
+               │ gRPC (ProcessPayment)    │ gRPC stream
+               ▼                          ▼
+┌──────────────────────────┐   ┌─────────────────────────────┐
+│  PAYMENT SERVICE         │   │  SUBSCRIBER / FRONTEND      │
+│  (port 8081 / 9091)      │   │  (stream-client)            │
+│                          │   │                             │
+│  gRPC Server             │   │  Receives real-time order   │
+│  REST GET /payments/:id  │   │  status updates             │
+│  Repository → payment_db │   └─────────────────────────────┘
+└──────────────────────────┘
 ```
 
 ---
 
-## 6. Dependency Flow
+## Contract-First Flow
 
 ```
-Handler → UseCase → Repository → Database
-             ↓
-        Payment Client → HTTP → Payment Service
+┌─────────────────┐     push      ┌──────────────────────────┐
+│   Repo A        │ ──────────►  │   GitHub Actions          │
+│   ap2-protos    │               │   (generate.yml)          │
+│                 │               │   runs protoc             │
+│  proto/         │               └──────────┬───────────────┘
+│   payment/v1/   │                          │ auto-push
+│   order/v1/     │                          ▼
+└─────────────────┘               ┌──────────────────────────┐
+                                  │   Repo B                  │
+                                  │   ap2-generated           │
+                                  │                           │
+                                  │  payment/v1/*.pb.go       │
+                                  │  order/v1/*.pb.go         │
+                                  │  → tagged v1.0.2          │
+                                  └──────────┬───────────────┘
+                                             │ go get @v1.0.2
+                                             ▼
+                                  ┌──────────────────────────┐
+                                  │  order-service           │
+                                  │  payment-service         │
+                                  └──────────────────────────┘
 ```
-
-* Handlers are thin (only HTTP logic)
-* Use cases contain business rules
-* Repository handles persistence
-* External communication goes through interfaces
 
 ---
 
-## 7. Conclusion
+## What Changed from Assignment 1
 
-This system demonstrates:
+| Component | Assignment 1 | Assignment 2 |
+|---|---|---|
+| Order → Payment | REST HTTP client | gRPC `ProcessPayment` |
+| External API | REST (Gin) | REST (Gin) — unchanged |
+| Streaming | None | `SubscribeToOrderUpdates` |
+| Schema management | None | `.proto` + GitHub Actions |
+| Configuration | Hardcoded strings | `.env` / environment variables |
+| PaymentClient | HTTP client | gRPC client |
 
-* Clean Architecture implementation
-* Proper microservice decomposition
-* Database per service pattern
-* Reliable inter-service communication
-* Robust failure handling
-* Idempotent request processing
+---
 
-The design ensures scalability, maintainability, and clear separation of concerns.
+## Clean Architecture — Unchanged Layers
+
+```
+Handler (transport)   ← UPDATED: added gRPC transport
+      ↓
+Use Case              ← UNCHANGED
+      ↓
+Repository            ← UNCHANGED
+      ↓
+Domain                ← UNCHANGED
+```
+
+Only the **transport/ports layer** was updated. Business logic remains identical.
+
+---
+
+## How to Run
+
+### Prerequisites
+- Go 1.21+
+- PostgreSQL running locally
+- Databases: `order_db` and `payment_db`
+
+### Step 1 — Run migrations
+
+**order_db:**
+```sql
+CREATE TABLE orders (
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    item_name TEXT NOT NULL,
+    amount BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    idempotency_key TEXT UNIQUE
+);
+```
+
+**payment_db:**
+```sql
+CREATE TABLE payments (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    transaction_id TEXT,
+    amount BIGINT NOT NULL,
+    status TEXT NOT NULL
+);
+```
+
+### Step 2 — Configure environment variables
+
+**payment-service/.env:**
+```
+DATABASE_URL=postgres://postgres:password@localhost:5432/payment_db?sslmode=disable
+GRPC_ADDR=:9091
+HTTP_ADDR=:8081
+```
+
+**order-service/.env:**
+```
+DATABASE_URL=postgres://postgres:password@localhost:5432/order_db?sslmode=disable
+PAYMENT_GRPC_ADDR=localhost:9091
+HTTP_ADDR=:8080
+ORDER_GRPC_ADDR=:9090
+```
+
+### Step 3 — Start Payment Service first
+```bash
+cd payment-service
+go run cmd/payment-service/main.go
+```
+
+### Step 4 — Start Order Service
+```bash
+cd order-service
+go run cmd/order-service/main.go
+```
+
+---
+
+## API Endpoints
+
+### Order Service (REST) — port 8080
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/orders` | Create new order (triggers gRPC payment) |
+| GET | `/orders/:id` | Get order by ID |
+| PATCH | `/orders/:id/cancel` | Cancel order |
+| GET | `/orders/revenue?customer_id=x` | Get revenue by customer |
+
+### Payment Service (REST) — port 8081
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/payments/:order_id` | Get payment by order ID |
+
+### gRPC Endpoints
+| Service | Method | Type | Port |
+|---------|--------|------|------|
+| PaymentService | ProcessPayment | Unary | 9091 |
+| OrderService | SubscribeToOrderUpdates | Server Streaming | 9090 |
+
+---
+
+## Testing
+
+### Create an order
+```bash
+curl -X POST http://localhost:8080/orders \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id": "c-1", "item_name": "Laptop", "amount": 5000}'
+```
+
+Expected response:
+```json
+{
+    "ID": "...",
+    "CustomerID": "c-1",
+    "ItemName": "Laptop",
+    "Amount": 5000,
+    "Status": "Paid",
+    "CreatedAt": "..."
+}
+```
+
+### Subscribe to real-time order updates (streaming)
+```bash
+cd stream-client
+go run main.go <order-id>
+```
+
+Expected output:
+```
+Subscribed to order: <order-id>
+[UPDATE] Status: Paid | Message: Status updated to Paid
+```
+
+---
+
+## Proto Definitions
+
+### PaymentService
+```protobuf
+service PaymentService {
+  rpc ProcessPayment(PaymentRequest) returns (PaymentResponse);
+}
+
+message PaymentRequest {
+  string order_id = 1;
+  int64  amount   = 2;
+}
+
+message PaymentResponse {
+  string transaction_id = 1;
+  string status         = 2;
+  google.protobuf.Timestamp processed_at = 3;
+}
+```
+
+### OrderService (Streaming)
+```protobuf
+service OrderService {
+  rpc SubscribeToOrderUpdates(OrderRequest) returns (stream OrderStatusUpdate);
+}
+
+message OrderRequest {
+  string order_id = 1;
+}
+
+message OrderStatusUpdate {
+  string order_id = 1;
+  string status   = 2;
+  string message  = 3;
+}
+```
+
+---
+
+## Generated Code Versions
+
+| Version | Changes |
+|---------|---------|
+| v1.0.0 | Initial generation |
+| v1.0.1 | Fixed go.mod go version |
+| v1.0.2 | Final version with correct grpc compatibility |
+
+---
+
+## Git History Summary
+
+- **Assignment 1 commits:** REST-based microservices with Clean Architecture
+- **Assignment 2 commits:** gRPC migration, proto repos, streaming, .env config
+
+---
+
+## Evidence
+
+1. GitHub Actions successful run — `ap2-generated` Actions tab
+2. Postman `201 Created` — Order created with `Status: Paid` via gRPC
+3. Stream client output — Real-time `[UPDATE] Status: Paid` from DB
+4. Both services running — Payment gRPC on :9091, Order gRPC on :9090
