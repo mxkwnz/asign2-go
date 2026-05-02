@@ -41,13 +41,12 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 	}
 
 	result, err := h.uc.CreateOrder(c, order)
-
 	if err != nil {
 		c.JSON(503, gin.H{"error": "payment service unavailable"})
 		return
 	}
-
 	c.JSON(201, result)
+
 }
 
 func (h *Handler) GetOrder(c *gin.Context) {
