@@ -36,5 +36,25 @@ func (s *PaymentGRPCServer) ProcessPayment(ctx context.Context, req *paymentv1.P
 		TransactionId: payment.TransactionID,
 		Status:        payment.Status,
 		ProcessedAt:   timestamppb.New(time.Now()),
+		Amount:        payment.Amount,
 	}, nil
+}
+
+func (s *PaymentGRPCServer) ListPayments(ctx context.Context, req *paymentv1.ListPaymentsRequest) (*paymentv1.ListPaymentsResponse, error) {
+	payments, err := s.uc.ListPayments(ctx, req.MinAmount, req.MaxAmount)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	var responses []*paymentv1.PaymentResponse
+	for _, p := range payments {
+		responses = append(responses, &paymentv1.PaymentResponse{
+			TransactionId: p.TransactionID,
+			Status:        p.Status,
+			Amount:        p.Amount,
+			ProcessedAt:   timestamppb.New(time.Now()),
+		})
+	}
+
+	return &paymentv1.ListPaymentsResponse{Payments: responses}, nil
 }

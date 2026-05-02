@@ -32,6 +32,9 @@ func (uc *OrderUseCase) CreateOrder(ctx context.Context, o domain.Order) (domain
 	}
 
 	o.Status = "Pending"
+	if o.IdempotencyKey == "" {
+		o.IdempotencyKey = o.ID
+	}
 	if err := uc.repo.Create(ctx, o); err != nil {
 		log.Printf("Failed to create order: %v", err)
 		return domain.Order{}, err
@@ -43,7 +46,7 @@ func (uc *OrderUseCase) CreateOrder(ctx context.Context, o domain.Order) (domain
 		log.Printf("Payment failed with error: %v", err)
 		uc.repo.UpdateStatus(ctx, o.ID, "Failed")
 		o.Status = "Failed"
-		return o, err
+		return o, nil
 	}
 
 	log.Printf("Payment status: %s", status)
