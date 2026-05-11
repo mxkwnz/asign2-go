@@ -1,71 +1,35 @@
 
----
+## Assignment 4 — Caching, Background Jobs & External Integrations
 
-### Idempotency Strategy
+### Invalidation Strategy
 
-Each payment event published to RabbitMQ contains a unique `event_id`
-field (a UUID generated at publish time, separate from the `order_id`).
+Cache-aside pattern is implemented in the Order Service using `go-redis`.
 
-When the Notification Service receives a message it follows this logic:
+- **Read path**: `GET /orders/:id` checks Redis first. On a hit, the cached order is returned immediately without a DB query. On a miss, the DB is queried, and the result is stored in Redis with a 5-minute TTL (`CACHE_TTL_SECONDS=300`).
+- **Write path (atomic invalidation)**: After any status update — payment completion, cancellation — the corresponding Redis key is deleted immediately. This ensures the next read always fetches fresh data from the DB and re-populates the cache.
+- **Cache key format**: `order:<uuid>`
 
-1. Parse the message body and extract `event_id`
-2. Check an **in-memory map** (`map[string]struct{}`) for that ID
-3. If the ID already exists → ACK the message silently, skip processing
-4. If the ID is new → process it, add to the map, then ACK
+### Retry & Exponential Backoff
 
-This ensures that if RabbitMQ redelivers a message (e.g. the consumer
-crashed before ACKing), the notification log is only printed once.
+The `NotificationWorker` retries failed email sends with exponential backoff:
 
-The map is protected by a `sync.Mutex` for safe concurrent access.
+- Attempt 1 fails → wait **2s** → retry
+- Attempt 2 fails → wait **4s** → retry
+- Attempt 3 fails → wait **8s** → give up, NACK message for requeue
 
-> **Trade-off**: The in-memory store is lost on service restart. For
-> production, this would be replaced with a Redis SET or a `processed_events`
-> DB table to survive restarts.
+Backoff formula: `2^attempt seconds`. Configurable via `MAX_RETRIES` env var.
 
----
+### Idempotency (Redis-backed)
 
-### ACK Logic
+Before sending a notification, the worker checks Redis for key `notification:sent:<event_id>`. If it exists with value `"sent"`, the event is skipped and the message is ACKed. On success, the key is written with a 24-hour TTL. This prevents duplicate emails even if RabbitMQ redelivers a message.
 
-The consumer is started with `autoAck: false`:
+### Email Provider Adapter
 
-```go
-msgs, err := ch.Consume(queue, "", false, ...)
-```
+The `EmailSender` interface decouples business logic from vendor implementation. The factory reads `PROVIDER_MODE`:
 
-A message is acknowledged **only after** the notification log is
-successfully printed:
+- `SIMULATED`: Logs the send, adds random latency (100–500ms), and randomly fails 30% of the time to test retry logic.
+- `REAL`: Uses standard SMTP (configure via `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`).
 
-```go
-log.Printf("[Notification] Sent email to %s ...", event.CustomerEmail)
-msg.Ack(false) // ACK only here
-```
+### Bonus: Redis Rate Limiter
 
-If JSON parsing fails (malformed / poison message), the message is
-rejected without requeue so it does not block the queue:
-
-```go
-msg.Nack(false, false) // discard, no requeue
-```
-
-The queue is declared as **durable** and messages are published as
-**Persistent** (`DeliveryMode: amqp.Persistent`), ensuring messages
-survive a RabbitMQ broker restart.
-
-**Delivery guarantee**: at-least-once. A message may be redelivered if
-the consumer crashes between processing and ACKing — the idempotency
-check above handles this case safely.
-
----
-
-### Graceful Shutdown
-
-All three services listen for `SIGINT` / `SIGTERM` via `os/signal`:
-
-```go
-quit := make(chan os.Signal, 1)
-signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-<-quit
-// close gRPC, HTTP, RabbitMQ connections cleanly
-```
-
-This ensures in-flight messages are not dropped when the service stops.
+A middleware on the Order Service uses Redis `INCR` + `EXPIRE` to count requests per client IP within a sliding window. Returns HTTP 429 when the limit is exceeded. Configurable via `RATE_LIMIT_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS`.    
