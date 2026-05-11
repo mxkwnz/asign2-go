@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"order-service/internal/cache"
 	"order-service/internal/domain"
 	"order-service/internal/ports"
 	"order-service/internal/repository"
@@ -12,14 +13,14 @@ import (
 type OrderUseCase struct {
 	repo    repository.OrderRepository
 	payment ports.PaymentPort
+	cache   cache.OrderCache
 }
 
-func NewOrderUseCase(r repository.OrderRepository, p ports.PaymentPort) *OrderUseCase {
-	return &OrderUseCase{repo: r, payment: p}
+func NewOrderUseCase(r repository.OrderRepository, p ports.PaymentPort, c cache.OrderCache) *OrderUseCase {
+	return &OrderUseCase{repo: r, payment: p, cache: c}
 }
 
 func (uc *OrderUseCase) CreateOrder(ctx context.Context, o domain.Order) (domain.Order, error) {
-
 	if o.IdempotencyKey != "" {
 		existing, err := uc.repo.GetByIdempotencyKey(ctx, o.IdempotencyKey)
 		if err == nil && existing.ID != "" {
@@ -46,6 +47,7 @@ func (uc *OrderUseCase) CreateOrder(ctx context.Context, o domain.Order) (domain
 		log.Printf("Payment failed with error: %v", err)
 		uc.repo.UpdateStatus(ctx, o.ID, "Failed")
 		o.Status = "Failed"
+		uc.cache.Delete(ctx, o.ID)
 		return o, nil
 	}
 
@@ -58,11 +60,24 @@ func (uc *OrderUseCase) CreateOrder(ctx context.Context, o domain.Order) (domain
 		o.Status = "Failed"
 	}
 
+	uc.cache.Delete(ctx, o.ID)
+
 	return o, nil
 }
 
 func (uc *OrderUseCase) GetOrder(ctx context.Context, id string) (domain.Order, error) {
-	return uc.repo.GetByID(ctx, id)
+	if cached, ok := uc.cache.Get(ctx, id); ok {
+		return cached, nil
+	}
+
+	order, err := uc.repo.GetByID(ctx, id)
+	if err != nil {
+		return domain.Order{}, err
+	}
+
+	uc.cache.Set(ctx, order)
+
+	return order, nil
 }
 
 func (uc *OrderUseCase) CancelOrder(ctx context.Context, id string) error {
@@ -75,7 +90,14 @@ func (uc *OrderUseCase) CancelOrder(ctx context.Context, id string) error {
 		return errors.New("cannot cancel paid order")
 	}
 
-	return uc.repo.UpdateStatus(ctx, id, "Cancelled")
+	err = uc.repo.UpdateStatus(ctx, id, "Cancelled")
+	if err != nil {
+		return err
+	}
+
+	uc.cache.Delete(ctx, id)
+
+	return nil
 }
 
 func (uc *OrderUseCase) GetRevenueByCustomer(ctx context.Context, customerID string) (int64, int, error) {
