@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"sync"
 	"time"
 
+	"notification-service/internal/worker"
+
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 )
 
 type PaymentEvent struct {
@@ -20,14 +22,13 @@ type PaymentEvent struct {
 }
 
 type NotificationConsumer struct {
-	conn         *amqp.Connection
-	channel      *amqp.Channel
-	queue        string
-	processedIDs map[string]struct{}
-	mu           sync.Mutex
+	conn    *amqp.Connection
+	channel *amqp.Channel
+	queue   string
+	worker  *worker.NotificationWorker
 }
 
-func NewNotificationConsumer(amqpURL, queueName string) (*NotificationConsumer, error) {
+func NewNotificationConsumer(amqpURL, queueName string, redisClient *redis.Client, w *worker.NotificationWorker) (*NotificationConsumer, error) {
 	conn, err := amqp.Dial(amqpURL)
 	if err != nil {
 		return nil, err
@@ -39,14 +40,7 @@ func NewNotificationConsumer(amqpURL, queueName string) (*NotificationConsumer, 
 		return nil, err
 	}
 
-	_, err = ch.QueueDeclare(
-		queueName,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
+	_, err = ch.QueueDeclare(queueName, true, false, false, false, nil)
 	if err != nil {
 		ch.Close()
 		conn.Close()
@@ -57,23 +51,15 @@ func NewNotificationConsumer(amqpURL, queueName string) (*NotificationConsumer, 
 
 	log.Printf("[Consumer] Connected to RabbitMQ, queue=%s", queueName)
 	return &NotificationConsumer{
-		conn:         conn,
-		channel:      ch,
-		queue:        queueName,
-		processedIDs: make(map[string]struct{}),
+		conn:    conn,
+		channel: ch,
+		queue:   queueName,
+		worker:  w,
 	}, nil
 }
 
 func (c *NotificationConsumer) Start(ctx context.Context) error {
-	msgs, err := c.channel.Consume(
-		c.queue,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
+	msgs, err := c.channel.Consume(c.queue, "", false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
@@ -82,44 +68,34 @@ func (c *NotificationConsumer) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[Consumer] Context cancelled, stopping consumer.")
+			log.Println("[Consumer] Context cancelled, stopping.")
 			return nil
 		case msg, ok := <-msgs:
 			if !ok {
 				log.Println("[Consumer] Channel closed.")
 				return nil
 			}
-			c.handleMessage(msg)
+			c.handleMessage(ctx, msg)
 		}
 	}
 }
 
-func (c *NotificationConsumer) handleMessage(msg amqp.Delivery) {
+func (c *NotificationConsumer) handleMessage(ctx context.Context, msg amqp.Delivery) {
 	var event PaymentEvent
 	if err := json.Unmarshal(msg.Body, &event); err != nil {
-		log.Printf("[Consumer] Failed to parse message: %v — NACKing (no requeue)", err)
-		msg.Nack(false, false)
+		log.Printf("[Consumer] Bad message: %v — discarding", err)
+		msg.Nack(false, false) // discard poison message
 		return
 	}
 
-	c.mu.Lock()
-	_, alreadyProcessed := c.processedIDs[event.EventID]
-	if !alreadyProcessed {
-		c.processedIDs[event.EventID] = struct{}{}
-	}
-	c.mu.Unlock()
+	log.Printf("[Consumer] Processing event %s for order %s", event.EventID, event.OrderID)
 
-	if alreadyProcessed {
-		log.Printf("[Consumer] Duplicate event %s — skipping, ACKing", event.EventID)
-		msg.Ack(false)
+	err := c.worker.ProcessNotification(ctx, event.EventID, event.OrderID, event.CustomerEmail, event.Amount)
+	if err != nil {
+		log.Printf("[Consumer] Failed to process event %s: %v — NACKing for requeue", event.EventID, err)
+		msg.Nack(false, true) // requeue for later
 		return
 	}
-
-	log.Printf("[Notification] Sent email to %s for Order #%s. Amount: $%.2f",
-		event.CustomerEmail,
-		event.OrderID,
-		float64(event.Amount)/100.0,
-	)
 
 	msg.Ack(false)
 }

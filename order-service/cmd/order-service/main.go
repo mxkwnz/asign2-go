@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"log"
 	"net"
@@ -8,14 +9,18 @@ import (
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
-	orderv1 "github.com/mxkwnz/ap2-generated/order/v1"
+	"order-service/internal/cache"
+	"order-service/internal/middleware"
 	"order-service/internal/ports"
 	"order-service/internal/repository"
 	grpcHandler "order-service/internal/transport/grpc"
 	httpHandler "order-service/internal/transport/http"
 	"order-service/internal/usecase"
+
+	orderv1 "github.com/mxkwnz/ap2-generated/order/v1"
 )
 
 func main() {
@@ -36,7 +41,18 @@ func main() {
 		log.Fatal("failed to connect to payment gRPC:", err)
 	}
 
-	uc := usecase.NewOrderUseCase(repo, paymentClient)
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
+	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	log.Printf("Connected to Redis at %s", redisAddr)
+
+	orderCache := cache.NewRedisOrderCache()
+	uc := usecase.NewOrderUseCase(repo, paymentClient, orderCache)
 
 	grpcAddr := os.Getenv("ORDER_GRPC_ADDR")
 	if grpcAddr == "" {
@@ -50,14 +66,18 @@ func main() {
 	orderv1.RegisterOrderServiceServer(grpcServer, grpcHandler.NewOrderGRPCServer(db))
 
 	go func() {
-		log.Printf("Order gRPC streaming server on %s", grpcAddr)
+		log.Printf("Order gRPC server on %s", grpcAddr)
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Fatal(err)
 		}
 	}()
 
+	rateLimiter := middleware.NewRateLimiter(redisClient)
 	handler := httpHandler.NewHandler(uc)
+
 	r := gin.Default()
+	r.Use(rateLimiter.Middleware())
+
 	r.POST("/orders", handler.CreateOrder)
 	r.GET("/orders/:id", handler.GetOrder)
 	r.PATCH("/orders/:id/cancel", handler.CancelOrder)
